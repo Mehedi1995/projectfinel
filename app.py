@@ -89,6 +89,8 @@ def clean_and_melt_energy_balance_data(df):
         value_name='energy_value_gwh'
     )
 
+####this programming is very good to work with the imporant thing is the name of the thing 
+
     # 3. Data Type Conversion and Cleaning
     # Convert 'year' to integer
     df_long['year'] = pd.to_numeric(df_long['year'], errors='coerce').astype('Int64')
