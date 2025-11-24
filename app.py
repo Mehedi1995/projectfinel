@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, jsonify, send_file
+'''from flask import Flask, render_template, request, jsonify, send_file
 import pandas as pd
 import numpy as np
 import plotly.express as px
@@ -811,4 +811,466 @@ def api_forecast():
     return jsonify(forecast_df.to_dict(orient='records'))
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(debug=True)'''
+
+"""
+Optimized Flask app for PythonAnywhere deployment.
+
+Key points:
+- No heavy work at import time (no prints).
+- Lazy data loading with caching and robust fallback.
+- Forecasts trained on-demand and cached.
+- Simple endpoints: '/', '/dashboard', '/forecast', '/download-csv'
+- Ready for PythonAnywhere WSGI: `app` variable exists.
+"""
+
+import logging
+from functools import lru_cache
+from io import BytesIO
+from datetime import datetime
+
+from flask import Flask, render_template, request, jsonify, send_file, abort
+
+# Data & ML libs
+import numpy as np
+import pandas as pd
+
+# Optional libs: plotly, sklearn, eurostat
+try:
+    import plotly.io as pio  # left unused here but available for templates
+    import plotly.express as px
+except Exception:
+    px = None
+    pio = None
+
+try:
+    from sklearn.linear_model import LinearRegression
+    from sklearn.ensemble import RandomForestRegressor
+except Exception:
+    LinearRegression = None
+    RandomForestRegressor = None
+
+try:
+    import eurostat
+    EUROSTAT_AVAILABLE = True
+except Exception:
+    eurostat = None
+    EUROSTAT_AVAILABLE = False
+
+# Configure logging (no prints)
+logger = logging.getLogger("euro_energy_app")
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter(
+        "%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+logger.setLevel(logging.INFO)
+
+app = Flask(__name__)
+
+# Minimal NUTS0 mapping (expand if you want)
+NUTS0_COUNTRY_MAP = {
+    'AL': 'Albania', 'AT': 'Austria', 'BE': 'Belgium', 'BG': 'Bulgaria',
+    'CY': 'Cyprus', 'CZ': 'Czechia', 'DE': 'Germany', 'DK': 'Denmark',
+    'EE': 'Estonia', 'EL': 'Greece', 'ES': 'Spain', 'FI': 'Finland',
+    'FR': 'France', 'HR': 'Croatia', 'HU': 'Hungary', 'IE': 'Ireland',
+    'IS': 'Iceland', 'IT': 'Italy', 'LT': 'Lithuania', 'LU': 'Luxembourg',
+    'LV': 'Latvia', 'ME': 'Montenegro', 'MK': 'North Macedonia', 'MT': 'Malta',
+    'NL': 'Netherlands', 'NO': 'Norway', 'PL': 'Poland', 'PT': 'Portugal',
+    'RO': 'Romania', 'RS': 'Serbia', 'SE': 'Sweden', 'SI': 'Slovenia',
+    'SK': 'Slovakia', 'TR': 'Türkiye', 'UA': 'Ukraine', 'UK': 'United Kingdom'
+}
+
+# -------------------------
+# Utilities and data loaders
+# -------------------------
+
+def _create_fallback_data():
+    """Create a small realistic fallback dataset to keep the app running."""
+    rng = np.random.RandomState(42)
+    countries = list(NUTS0_COUNTRY_MAP.values())[:12]
+    energy_types = ['Total Renewable', 'Hydro', 'Wind', 'Solar', 'Biomass']
+    years = list(range(2010, 2024))
+
+    rows = []
+    for year in years:
+        for country in countries:
+            base_total = 100000 + (year - 2010) * 5000
+            for et in energy_types:
+                # create plausible renewable share percentages
+                base = {
+                    'Total Renewable': 20.0,
+                    'Hydro': 10.0,
+                    'Wind': 6.0,
+                    'Solar': 2.0,
+                    'Biomass': 4.0
+                }.get(et, 2.0)
+                growth = {
+                    'Total Renewable': 1.2,
+                    'Hydro': 0.1,
+                    'Wind': 0.7,
+                    'Solar': 0.9,
+                    'Biomass': 0.3
+                }.get(et, 0.2)
+                share = max(0.5, base + growth * (year - 2010) + rng.normal(0, 1.5))
+                absolute_gwh = (share / 100.0) * base_total
+                rows.append({
+                    'country_name': country,
+                    'Year': int(year),
+                    'Energy_Type': et,
+                    'Renewable_Share': round(float(share), 1),
+                    'Total_Energy_GWh': round(float(base_total), 1),
+                    'Renewable_Absolute_GWh': round(float(absolute_gwh), 1),
+                    'DataSource': 'fallback'
+                })
+    return pd.DataFrame(rows)
+
+
+@lru_cache(maxsize=1)
+def load_data():
+    """
+    Load and return the processed dataset as a DataFrame.
+    This function is cached (so repeated calls are fast).
+    """
+    logger.info("load_data(): called")
+
+    if EUROSTAT_AVAILABLE:
+        try:
+            # Try to fetch data. Keep this minimal to avoid errors on PythonAnywhere.
+            # We keep the processing conservative: select a few useful columns and normalize names.
+            logger.info("Eurostat available: attempting to fetch datasets")
+            re_df = eurostat.get_data_df('nrg_ind_ren')  # renewable indicators
+            bal_df = eurostat.get_data_df('nrg_bal_s')  # energy balances
+
+            # Attempt to melt/reshape the two datasets robustly.
+            # Keep only the columns we need and coerce problematic formats.
+            # --- Renewable indicators processing ---
+            # Look for a 'geo' column and year columns; fall back to simple conversions
+            if 'geo\\TIME_PERIOD' in re_df.columns:
+                re_df = re_df.rename(columns={'geo\\TIME_PERIOD': 'geo'})
+            # We attempt to melt numeric columns (years)
+            id_vars = [c for c in re_df.columns if not c.isdigit()]  # heuristic
+            year_cols = [c for c in re_df.columns if c.isdigit()]
+            if year_cols:
+                re_long = re_df.melt(id_vars=id_vars, var_name='Year', value_name='value')
+            else:
+                re_long = re_df.rename(columns={'time_period': 'Year', 'value': 'value'}) if 'value' in re_df.columns else re_df.copy()
+            # Normalize
+            re_long['Year'] = pd.to_numeric(re_long['Year'], errors='coerce').astype('Int64')
+            # Some eurostat datasets use code columns; try minimal mapping
+            if 'geo' not in re_long.columns and 'geo\\TIME_PERIOD' not in re_df.columns:
+                # try to find equivalent column
+                for candidate in ['geo\\TIME_PERIOD', 'geo', 'COUNTRY']:
+                    if candidate in re_df.columns:
+                        re_long = re_df.rename(columns={candidate: 'geo'})
+                        break
+
+            # --- Energy balance processing (minimal) ---
+            if 'geo\\TIME_PERIOD' in bal_df.columns:
+                bal_df = bal_df.rename(columns={'geo\\TIME_PERIOD': 'geo'})
+            # Try to find year columns
+            year_cols_bal = [c for c in bal_df.columns if c.isdigit()]
+            if year_cols_bal:
+                bal_long = bal_df.melt(id_vars=[c for c in bal_df.columns if c not in year_cols_bal],
+                                       var_name='Year', value_name='value')
+                bal_long['Year'] = pd.to_numeric(bal_long['Year'], errors='coerce').astype('Int64')
+            else:
+                bal_long = bal_df.copy()
+
+            # Now produce a simple merged dataframe keyed by country code/name, year and some energy type inference.
+            # This minimal pipeline is intentionally defensive and will fall back if expected columns are missing.
+            # We'll attempt to get country code / country name mapping
+            country_col = None
+            for c in ['geo', 'country', 'geo\\TIME_PERIOD', 'geo_code']:
+                if c in re_long.columns:
+                    country_col = c
+                    break
+
+            if country_col is None:
+                # fallback to our synthetic dataset
+                logger.warning("Could not find geo column in Eurostat data; using fallback dataset")
+                return _create_fallback_data()
+
+            # Compose a small dataset from the renewable long data:
+            # For simplicity, group by geo and Year and compute mean of 'value' (approx renewable share)
+            minimal = re_long[[country_col, 'Year', 'value']].copy()
+            minimal = minimal.rename(columns={country_col: 'geo', 'value': 'renewable_share_pct'})
+            minimal = minimal.dropna(subset=['geo', 'Year', 'renewable_share_pct'])
+            # Map geo to human country names
+            minimal['country_code'] = minimal['geo'].astype(str).str[:2].str.upper()
+            minimal['country_name'] = minimal['country_code'].map(NUTS0_COUNTRY_MAP).fillna(minimal['country_code'])
+            # Aggregate by country_name/Year
+            agg = minimal.groupby(['country_name', 'Year'], as_index=False)['renewable_share_pct'].mean()
+            # Build a tidy DF with several energy types using simple heuristics (Total Renewable + placeholders)
+            rows = []
+            for _, r in agg.iterrows():
+                total_energy = 100000 + (int(r['Year']) - 2010) * 5000
+                share = float(r['renewable_share_pct'])
+                rows.append({
+                    'country_name': r['country_name'],
+                    'Year': int(r['Year']),
+                    'Energy_Type': 'Total Renewable',
+                    'Renewable_Share': round(share, 1),
+                    'Total_Energy_GWh': total_energy,
+                    'Renewable_Absolute_GWh': round((share / 100.0) * total_energy, 1),
+                    'DataSource': 'Eurostat (minimal)'
+                })
+            if rows:
+                df = pd.DataFrame(rows)
+                logger.info("Eurostat minimal dataset prepared")
+                return df
+
+            # If no rows, fallback
+            logger.warning("Eurostat fetch succeeded but no usable rows found; using fallback")
+            return _create_fallback_data()
+
+        except Exception as e:
+            logger.exception("Error loading Eurostat data, falling back: %s", e)
+            return _create_fallback_data()
+    else:
+        logger.info("Eurostat package is not available; using fallback data.")
+        return _create_fallback_data()
+
+
+# -------------------------
+# Forecasting utilities
+# -------------------------
+
+@lru_cache(maxsize=256)
+def create_forecast_cached(countries_tuple, energy_types_tuple, years_to_forecast=5):
+    """
+    Create forecasts for a set of countries and energy types and return as DataFrame.
+    This is cached for performance.
+    """
+    # Convert cached arguments back to lists
+    countries = list(countries_tuple)
+    energy_types = list(energy_types_tuple)
+
+    df = load_data()
+    forecasts = []
+
+    # require sklearn, otherwise return empty df
+    if LinearRegression is None or RandomForestRegressor is None:
+        logger.warning("sklearn not available: skipping model-based forecasting")
+        return pd.DataFrame()
+
+    for country in countries:
+        for energy_type in energy_types:
+            subset = df[(df['country_name'] == country) & (df['Energy_Type'] == energy_type)].sort_values('Year')
+            if len(subset) < 4:
+                # Not enough points to train reliable models
+                continue
+
+            X = subset[['Year']].astype(float).values.reshape(-1, 1)
+            y = subset['Renewable_Share'].astype(float).values.reshape(-1, )
+
+            try:
+                lr = LinearRegression()
+                lr.fit(X, y)
+                rf = RandomForestRegressor(n_estimators=50, random_state=42)
+                rf.fit(X, y)
+            except Exception as e:
+                logger.exception("Model training failed for %s %s: %s", country, energy_type, e)
+                continue
+
+            last_year = int(subset['Year'].max())
+            future_years = list(range(last_year + 1, last_year + years_to_forecast + 1))
+            if not future_years:
+                continue
+            X_future = np.array(future_years).reshape(-1, 1)
+
+            try:
+                pred_lr = lr.predict(X_future)
+                pred_rf = rf.predict(X_future)
+                combined = (pred_lr + pred_rf) / 2.0
+                combined = np.clip(combined, 0.0, 100.0)
+            except Exception as e:
+                logger.exception("Prediction failed for %s %s: %s", country, energy_type, e)
+                continue
+
+            for yr, sh in zip(future_years, combined):
+                forecasts.append({
+                    'country_name': country,
+                    'Year': int(yr),
+                    'Energy_Type': energy_type,
+                    'Renewable_Share': round(float(sh), 1),
+                    'Type': 'Forecast'
+                })
+
+    if forecasts:
+        return pd.DataFrame(forecasts)
+    else:
+        return pd.DataFrame()
+
+
+# -------------------------
+# Flask routes
+# -------------------------
+
+@app.route('/')
+def home():
+    """
+    Render landing page with basic stats.
+    """
+    df = load_data()
+    countries = sorted(df['country_name'].unique()) if not df.empty else []
+    energy_types = sorted(df['Energy_Type'].unique()) if 'Energy_Type' in df.columns else ['Total Renewable']
+    years = sorted(df['Year'].unique()) if 'Year' in df.columns else []
+
+    latest_year = int(df['Year'].max()) if not df.empty else None
+    avg_renewable = float(df[df['Year'] == latest_year]['Renewable_Share'].mean()) if latest_year else 0.0
+
+    stats = {
+        'total_countries': len(countries),
+        'latest_year': latest_year,
+        'avg_renewable': round(avg_renewable, 1),
+        'data_years': f"{int(df['Year'].min())}-{int(df['Year'].max())}" if not df.empty else "N/A",
+        'data_source': "Eurostat" if EUROSTAT_AVAILABLE else "fallback"
+    }
+
+    return render_template('index.html',
+                           countries=countries,
+                           energy_types=energy_types,
+                           years=years,
+                           stats=stats)
+
+
+@app.route('/dashboard')
+def dashboard():
+    """
+    Render dashboard with charts embedded in the template.
+    Chart generation is intentionally minimal here (we pass JSON / HTML fragments).
+    """
+    df = load_data()
+    # parse query params with simple defaults
+    countries = request.args.getlist('countries') or sorted(df['country_name'].unique())[:3]
+    energy_types = request.args.getlist('energy_types') or ['Total Renewable']
+    year = request.args.get('year', 'All')
+    show_forecast = request.args.get('show_forecast', 'false') == 'true'
+    forecast_years = int(request.args.get('forecast_years', 5))
+
+    # filter
+    filtered = df.copy()
+    if countries:
+        filtered = filtered[filtered['country_name'].isin(countries)]
+    if energy_types:
+        filtered = filtered[filtered['Energy_Type'].isin(energy_types)]
+    if year and year != 'All':
+        try:
+            y = int(year)
+            filtered = filtered[filtered['Year'] == y]
+        except Exception:
+            pass
+
+    # Build minimal chart HTML using plotly if available; otherwise pass empty strings
+    chart1_html = chart2_html = chart3_html = ""
+    if px is not None and not filtered.empty:
+        try:
+            # Primary chart: Renewable share time series for primary country & energy type
+            primary_country = countries[0] if countries else filtered['country_name'].iloc[0]
+            primary_type = energy_types[0] if energy_types else filtered['Energy_Type'].iloc[0]
+            ts = filtered[(filtered['country_name'] == primary_country) &
+                          (filtered['Energy_Type'] == primary_type)].sort_values('Year')
+            if not ts.empty:
+                fig = px.line(ts, x='Year', y='Renewable_Share',
+                              title=f"{primary_country} - {primary_type} share over time")
+                chart1_html = fig.to_html(full_html=False, include_plotlyjs='cdn')
+        except Exception:
+            chart1_html = ""
+
+    # If forecast requested, compute it
+    forecast_df = pd.DataFrame()
+    if show_forecast:
+        forecast_df = create_forecast_cached(tuple(countries), tuple(energy_types), years_to_forecast=forecast_years)
+
+    # Some lightweight stats for the template
+    summary_stats = {
+        'selected_countries': countries,
+        'selected_energy_types': energy_types,
+        'rows': len(filtered),
+        'forecast_rows': len(forecast_df)
+    }
+
+    return render_template('dashboard.html',
+                           chart1=chart1_html,
+                           chart2=chart2_html,
+                           chart3=chart3_html,
+                           stats=summary_stats,
+                           chart1_tooltips=[],
+                           chart2_tooltips=[],
+                           chart3_tooltips=[],
+                           show_forecast=show_forecast)
+
+
+@app.route('/forecast', methods=['GET'])
+def forecast_api():
+    """
+    Simple JSON API for forecasts.
+    Query args:
+      - countries (multiple)
+      - energy_types (multiple)
+      - years (int, default 5)
+    """
+    df = load_data()
+    countries = request.args.getlist('countries')
+    energy_types = request.args.getlist('energy_types')
+    years = int(request.args.get('years', 5))
+
+    # Defaults
+    if not countries:
+        countries = sorted(df['country_name'].unique())[:3]
+    if not energy_types:
+        energy_types = ['Total Renewable']
+
+    forecast_df = create_forecast_cached(tuple(countries), tuple(energy_types), years_to_forecast=years)
+    if forecast_df.empty:
+        return jsonify({'forecast': []})
+    return jsonify(forecast_df.to_dict(orient='records'))
+
+
+@app.route('/download-csv')
+def download_csv():
+    """
+    Download filtered dataset as CSV.
+    Query args match the dashboard endpoint.
+    """
+    df = load_data()
+    countries = request.args.getlist('countries')
+    energy_types = request.args.getlist('energy_types')
+    year = request.args.get('year', 'All')
+
+    filtered = df.copy()
+    if countries:
+        filtered = filtered[filtered['country_name'].isin(countries)]
+    if energy_types:
+        filtered = filtered[filtered['Energy_Type'].isin(energy_types)]
+    if year and year != 'All':
+        try:
+            y = int(year)
+            filtered = filtered[filtered['Year'] == y]
+        except Exception:
+            pass
+
+    if filtered.empty:
+        abort(404, description="No data available for the selected filters")
+
+    csv_bytes = filtered.to_csv(index=False).encode('utf-8')
+    buf = BytesIO(csv_bytes)
+    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    filename = f"euro_energy_export_{ts}.csv"
+
+    return send_file(buf,
+                     attachment_filename=filename,
+                     as_attachment=True,
+                     mimetype='text/csv')
+
+
+# -------------------------
+# CLI / local run
+# -------------------------
+
+if __name__ == "__main__":
+    # Local debugging only — PythonAnywhere will ignore this block when run under WSGI.
+    app.run(debug=True, host="0.0.0.0", port=5000)
